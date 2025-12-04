@@ -1,0 +1,444 @@
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+    getAuth, 
+    signInAnonymously, 
+    signInWithCustomToken, 
+    onAuthStateChanged, 
+    signOut,
+    GoogleAuthProvider,
+    signInWithPopup,
+} from 'firebase/auth';
+import { 
+    getFirestore, 
+    addDoc, 
+    onSnapshot, 
+    collection, 
+    query, 
+    serverTimestamp, 
+    setLogLevel, 
+    where,
+    getDocs,
+    deleteDoc, 
+    doc,       
+    updateDoc  
+} from 'firebase/firestore';
+
+// --- Global Firebase Configuration Variables (Provided by Canvas Environment) ---
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Initialize Firebase App and Services
+let app, db, auth;
+try {
+    if (Object.keys(firebaseConfig).length > 0) {
+        app = initializeApp(firebaseConfig);
+        db = getFirestore(app);
+        auth = getAuth(app);
+        setLogLevel('debug');
+    }
+} catch (error) {
+    console.error("Firebase initialization failed:", error);
+}
+
+// Helper to get the public collection paths
+const getListingsCollectionRef = (db, appId) => collection(db, `artifacts/${appId}/public/data/listings`);
+const getRatingsCollectionRef = (db, appId) => collection(db, `artifacts/${appId}/public/data/user_ratings`);
+
+// SVG for Star Icon
+const StarIcon = ({ fill = false }) => (
+    <svg className={`w-5 h-5 transition duration-150 ${fill ? 'text-yellow-400' : 'text-gray-300'}`} 
+         xmlns="http://www.w3.org/2000/svg" 
+         viewBox="0 0 24 24" 
+         fill={fill ? "currentColor" : "none"} 
+         stroke={fill ? "currentColor" : "currentColor"}
+         strokeWidth="2" 
+         strokeLinecap="round" 
+         strokeLinejoin="round">
+        <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+    </svg>
+);
+
+
+// --- Component: Search and Filter Controls ---
+const SearchAndFilterControls = ({ searchTerm, setSearchTerm, filterStatus, setFilterStatus }) => (
+    <div className="flex flex-col sm:flex-row gap-4 mb-6 p-4 bg-white rounded-xl shadow-lg border border-gray-100">
+        
+        {/* Search Input */}
+        <div className="relative flex-grow">
+            <input
+                type="text"
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                placeholder="Search by item name, description, or want..."
+                className="w-full pl-10 pr-4 py-3 border border-gray-300 rounded-xl focus:ring-indigo-500 focus:border-indigo-500 transition duration-150"
+            />
+            <svg className="absolute left-3 top-1/2 transform -translate-y-1/2 h-5 w-5 text-gray-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+            </svg>
+        </div>
+
+        {/* Status Filter Dropdown */}
+        <div className="sm:w-48 relative">
+            <select
+                value={filterStatus}
+                onChange={(e) => setFilterStatus(e.target.value)}
+                className="w-full p-3 border border-gray-300 rounded-xl focus:ring-teal-500 focus:border-teal-500 transition duration-150 appearance-none bg-white pr-8"
+            >
+                <option value="available">Status: Available</option>
+                <option value="traded">Status: Traded</option>
+                <option value="all">Status: All</option>
+            </select>
+            <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-700">
+                {/* SVG for dropdown arrow */}
+                <svg className="h-4 w-4 fill-current" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+                    <path d="M9.293 12.95l.707.707L15.657 8l-1.414-1.414L10 10.828 5.757 6.586 4.343 8z"/>
+                </svg>
+            </div>
+        </div>
+    </div>
+);
+
+
+// --- Component: Confirmation Modal ---
+const ConfirmationModal = ({ isOpen, onClose, title, message, onConfirm }) => {
+    if (!isOpen) return null;
+
+    return (
+        <div className="fixed inset-0 z-50 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4">
+            <div className="bg-white rounded-2xl w-full max-w-sm p-6 shadow-2xl transform transition-all">
+                <h3 className="text-xl font-bold text-gray-800 mb-4 border-b pb-2">{title}</h3>
+                <p className="text-gray-700 mb-6">{message}</p>
+
+                <div className="flex justify-end space-x-3">
+                    <button
+                        onClick={onClose}
+                        className="bg-gray-200 hover:bg-gray-300 text-gray-800 font-semibold py-2 px-4 rounded-xl transition duration-150"
+                    >
+                        Cancel
+                    </button>
+                    <button
+                        onClick={() => { onConfirm(); onClose(); }}
+                        className="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-xl shadow-lg transition duration-150"
+                    >
+                        Confirm
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+// --- Component: Edit Listing Modal ---
+const EditListingModal = ({ isOpen, onClose, db, listing, onListingUpdated }) => {
+    // Initialize state using listing data. Use useEffect to update if listing changes (re-opening for a new item)
+    const [itemName, setItemName] = useState('');
+    const [description, setDescription] = useState('');
+    const [wants, setWants] = useState('');
+    const [imageUrl, setImageUrl] = useState('');
+    const [status, setStatus] = useState('available');
+    const [isSaving, setIsSaving] = useState(false);
+    const [error, setError] = useState(null);
+
+    // Note: The edit modal does not support uploading new photos via file input 
+    // to keep the complexity manageable, only updating the URL field.
+    useEffect(() => {
+        if (listing) {
+            setItemName(listing.itemName || '');
+            setDescription(listing.description || '');
+            setWants(listing.wants || '');
+            // If the URL is a long Base64 string, don't show it in the input to avoid UX issues
+            const currentImageUrl = listing.imageUrl || '';
+            const isBase64 = currentImageUrl.startsWith('data:image/');
+            setImageUrl(isBase64 ? 'Image uploaded via camera/file (Base64 data)' : currentImageUrl);
+            setStatus(listing.status || 'available');
+            setError(null);
+        }
+    }, [listing]);
+
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        if (!itemName || !description || !wants || !listing?.id) {
+            setError("All item details must be filled out to update the listing.");
+            return;
+        }
+
+        setIsSaving(true);
+        setError(null);
+
+        // Keep the original URL if the user hasn't changed the disabled input
+        const finalImageUrl = imageUrl.startsWith('Image uploaded via camera') ? listing.imageUrl : imageUrl.trim();
+
+        try {
+            const docRef = doc(db, `artifacts/${appId}/public/data/listings`, listing.id);
+            await updateDoc(docRef, {
+                itemName: itemName.trim(),
+                description: description.trim(),
+                wants: wants.trim(),
+                imageUrl: finalImageUrl,
+                status: status,
+            });
+
+            onListingUpdated();
+            onClose();
+        } catch (e) {
+            console.error("Error updating document: ", e);
+            setError("Failed to update listing. Please check your connection.");
+        } finally {
+            setIsSaving(false);
+        }
+    };
+
+    if (!isOpen || !listing) return null;
+
+    return (
+        <div className="fixed inset-0 z-50 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4">
+            <div className="bg-white rounded-2xl w-full max-w-lg p-6 shadow-2xl transform transition-all">
+                <h3 className="text-2xl font-bold text-gray-800 mb-4 border-b pb-2">Edit Listing: {listing.itemName}</h3>
+                
+                {error && <p className="text-sm text-red-500 font-medium mb-4">{error}</p>}
+
+                <form onSubmit={handleSubmit} className="space-y-4">
+                    <div>
+                        <label className="block text-sm font-semibold text-gray-700 mb-1">Item I Have:</label>
+                        <input
+                            type="text"
+                            value={itemName}
+                            onChange={(e) => setItemName(e.target.value)}
+                            className="w-full p-3 border border-gray-300 rounded-xl focus:ring-teal-500 focus:border-teal-500 transition duration-150"
+                            required
+                        />
+                    </div>
+                    <div>
+                        <label className="block text-sm font-semibold text-gray-700 mb-1">Description:</label>
+                        <textarea
+                            value={description}
+                            onChange={(e) => setDescription(e.target.value)}
+                            rows="3"
+                            className="w-full p-3 border border-gray-300 rounded-xl focus:ring-teal-500 focus:border-teal-500 transition duration-150 resize-none"
+                            required
+                        ></textarea>
+                    </div>
+                    <div>
+                        <label className="block text-sm font-semibold text-gray-700 mb-1">What I Want In Exchange:</label>
+                        <input
+                            type="text"
+                            value={wants}
+                            onChange={(e) => setWants(e.target.value)}
+                            className="w-full p-3 border border-gray-300 rounded-xl focus:ring-teal-500 focus:border-teal-500 transition duration-150"
+                            required
+                        />
+                    </div>
+                    <div>
+                        <label className="block text-sm font-semibold text-gray-700 mb-1">Image URL (Optional):</label>
+                        <input
+                            type="url"
+                            value={imageUrl}
+                            onChange={(e) => setImageUrl(e.target.value)}
+                            className="w-full p-3 border border-gray-300 rounded-xl focus:ring-teal-500 focus:border-teal-500 transition duration-150"
+                            disabled={imageUrl.startsWith('Image uploaded via camera')} // Disable if it's a long base64 string
+                        />
+                         {imageUrl.startsWith('Image uploaded via camera') && (
+                             <p className="text-xs text-gray-500 mt-1">
+                                To update this image, please delete and re-list, or paste a new image URL above.
+                             </p>
+                         )}
+                    </div>
+                    
+                    <div>
+                        <label className="block text-sm font-semibold text-gray-700 mb-1">Status:</label>
+                        <select
+                            value={status}
+                            onChange={(e) => setStatus(e.target.value)}
+                            className="w-full p-3 border border-gray-300 rounded-xl focus:ring-teal-500 focus:border-teal-500 transition duration-150"
+                        >
+                            <option value="available">Available (Ready to Trade)</option>
+                            <option value="traded">Traded (Inactive)</option>
+                        </select>
+                    </div>
+
+                    <div className="flex justify-end space-x-3 pt-4">
+                        <button
+                            type="button"
+                            onClick={onClose}
+                            className="bg-gray-200 hover:bg-gray-300 text-gray-800 font-semibold py-2 px-4 rounded-xl transition duration-150"
+                            disabled={isSaving}
+                        >
+                            Cancel
+                        </button>
+                        <button
+                            type="submit"
+                            className="bg-teal-500 hover:bg-teal-600 text-white font-bold py-2 px-4 rounded-xl shadow-lg transition duration-150 disabled:opacity-50"
+                            disabled={isSaving}
+                        >
+                            {isSaving ? 'Saving...' : 'Save Changes'}
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    );
+};
+
+// --- Component: Rating Modal ---
+const RatingModal = ({ isOpen, onClose, db, reviewerId, targetUserId, targetUserName, onRatingSubmitted }) => {
+    const [score, setScore] = useState(0);
+    const [comment, setComment] = useState('');
+    const [isSaving, setIsSaving] = useState(false);
+    const [error, setError] = useState(null);
+
+    // Reset state when modal opens/closes
+    useEffect(() => {
+        if (isOpen) {
+            setScore(0);
+            setComment('');
+            setError(null);
+        }
+    }, [isOpen]);
+
+    const handleSubmit = async () => {
+        if (score === 0) {
+            setError("Please select a score (1-5 stars).");
+            return;
+        }
+        if (reviewerId === targetUserId) {
+             setError("You cannot rate yourself!");
+            return;
+        }
+
+        setIsSaving(true);
+        setError(null);
+
+        try {
+            const q = query(
+                getRatingsCollectionRef(db, appId),
+                where("reviewerId", "==", reviewerId),
+                where("ratedUserId", "==", targetUserId)
+            );
+            const snapshot = await getDocs(q);
+
+            if (!snapshot.empty) {
+                setError("You have already submitted a rating for this user.");
+                setIsSaving(false);
+                return;
+            }
+
+            await addDoc(getRatingsCollectionRef(db, appId), {
+                ratedUserId: targetUserId,
+                reviewerId: reviewerId,
+                score: score,
+                comment: comment.trim(),
+                ratedAt: serverTimestamp(),
+            });
+
+            onRatingSubmitted(); 
+            onClose(); 
+        } catch (e) {
+            console.error("Error adding rating: ", e);
+            setError("Failed to submit rating. Please check your connection.");
+        } finally {
+            setIsSaving(false);
+        }
+    };
+
+    if (!isOpen) return null;
+
+    return (
+        <div className="fixed inset-0 z-50 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4">
+            <div className="bg-white rounded-2xl w-full max-w-lg p-6 shadow-2xl transform transition-all">
+                <h3 className="text-2xl font-bold text-gray-800 mb-4 border-b pb-2">Rate {targetUserName}</h3>
+                <p className="text-sm text-gray-600 mb-4">You are rating user: <span className="font-mono text-xs break-all text-indigo-600">{targetUserId}</span></p>
+
+                <div className="mb-4">
+                    <label className="block text-sm font-semibold text-gray-700 mb-2">Your Score:</label>
+                    <div className="flex space-x-1">
+                        {[1, 2, 3, 4, 5].map((i) => (
+                            <button
+                                key={i}
+                                type="button"
+                                onClick={() => setScore(i)}
+                                className={`p-1 rounded-full transition duration-150 ${i <= score ? 'text-yellow-400' : 'text-gray-300'} hover:scale-110`}
+                            >
+                                <StarIcon fill={i <= score} />
+                            </button>
+                        ))}
+                    </div>
+                </div>
+
+                <div className="mb-6">
+                    <label className="block text-sm font-semibold text-gray-700 mb-2">Comment (Optional):</label>
+                    <textarea
+                        value={comment}
+                        onChange={(e) => setComment(e.target.value)}
+                        placeholder="Share your experience (e.g., 'Quick communication' or 'Item was exactly as described')."
+                        rows="3"
+                        className="w-full p-3 border border-gray-300 rounded-xl focus:ring-teal-500 focus:border-teal-500 transition duration-150 resize-none"
+                    ></textarea>
+                </div>
+
+                {error && <p className="text-sm text-red-500 font-medium mb-4">{error}</p>}
+
+                <div className="flex justify-end space-x-3">
+                    <button
+                        onClick={onClose}
+                        className="bg-gray-200 hover:bg-gray-300 text-gray-800 font-semibold py-2 px-4 rounded-xl transition duration-150"
+                        disabled={isSaving}
+                    >
+                        Cancel
+                    </button>
+                    <button
+                        onClick={handleSubmit}
+                        className="bg-teal-500 hover:bg-teal-600 text-white font-bold py-2 px-4 rounded-xl shadow-lg transition duration-150 disabled:opacity-50"
+                        disabled={isSaving || score === 0}
+                    >
+                        {isSaving ? 'Submitting...' : 'Submit Rating'}
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+
+// --- Component: Authentication Panel ---
+const AuthPanel = ({ auth, user, userRatings }) => {
+    const isAnonymous = user?.isAnonymous;
+    const provider = new GoogleAuthProvider();
+
+    const handleGoogleSignIn = async () => {
+        try {
+            await signInWithPopup(auth, provider);
+        } catch (error) {
+            console.error("Google Sign-In Error:", error);
+        }
+    };
+
+    const handleSignOut = async () => {
+        try {
+            await signOut(auth);
+            await signInAnonymously(auth); 
+        } catch (error) {
+            console.error("Sign-Out Error:", error);
+        }
+    };
+
+    if (!user) {
+        return <p className="text-gray-500 text-sm">Authentication loading...</p>;
+    }
+
+    const currentUserRating = userRatings[user.uid];
+
+    if (isAnonymous) {
+        return (
+            <div className="flex flex-col items-center space-y-3 p-2">
+                <span className="text-sm font-medium text-gray-700 text-center">
+                    Your Temporary ID: <span className="text-indigo-600 font-mono text-xs block break-all">{user.uid}</span>
+                </span>
+                <button
+                    onClick={handleGoogleSignIn}
+                    className="flex items-center w-full justify-center bg-blue-500 hover:bg-blue-600 text-white font-semibold py-2 px-3 rounded-xl shadow-md transition duration-200 text-sm"
+                >
+                    <svg className="w-4 h-4 mr-2" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M43.611 20.0833H42V20H24V28H35.842C34.78 32.101 31.848 34.737 28.002 35.842V35.842L42 48V47.28L43.611 46.475V43.611C43.611 41.545 44.407 39.575 45.833 38.083V38.083L42.54 35.842C44.706 33.725 45.92 30.825 45.92 27.67C45.92 23.468 44.025 19.504 40.875 16.71L43.611 20.0833Z" fill="#FFC107"/>
+                        <path d="M12.9167 36.1667L15.6527 38.8997C19.1677 42.4147 23.0017 44 26.8337 44C30.6657 44 34.5007 42.4147 38.0157 38.8997L40.7497 36.1667L38.0157 33.4337C34.5007 36.9487 30.6657 38.5337 26.8337 38.5337C23.001
